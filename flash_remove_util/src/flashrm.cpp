@@ -1,172 +1,159 @@
 #include "../hdr/flashrm.hpp"
-
+#include <fstream>
+#include <opencv2/highgui.hpp>
+#include "opencv2/videoio.hpp"
+#include <iostream>
+#include <immintrin.h>
+#include <opencv2/core/utility.hpp>
+#include <tbb/tbb.h>
 class VideoReadingException : public std::exception {
 public:
-    std::string what() {
-        return "frame was not read!\n";
-    }
+  std::string what() { return "frame was not read!\n"; }
 };
+cv::Mat lumCalcParallel(cv::Mat img){
 
+  using namespace cv;
+  Size s = img.size();
+  Mat lum = Mat(s,CV_16UC1);
 
-cv::Mat lumCalc(const cv::Mat& img)
-{
-    using namespace cv;
-    Size s = img.size();
-    Mat lum = Mat(s, CV_32FC1);
-    for (size_t j = 0; j < s.height; j++)
-    {
-        for (size_t k = 0; k < s.width; k++)
-        {
-            lum.at<float>(j, k) = 16 + 65.738 * double(img.at<Vec3b>(j, k)[2]) / 256.0 +
-                129.057 * double(img.at<Vec3b>(j, k)[1]) / 256.0 + 25.064 * double(img.at<Vec3b>(j, k)[0]) / 256.0;
-        }
-    }
-    return lum;
+  parallel_for_(Range(0,s.height*s.width),[&](const Range& range){
+      for (int r= range.start; r<range.end; ++r){
+        size_t i = r/s.width;
+        size_t j = r % s.width;
+        Vec3b valsImg = img.ptr<Vec3b>(i)[j];
+        double val = 16. + valsImg[0] * 65.738 / 256. +
+                     valsImg[1] * 129.057 / 256. + valsImg[2] * 25.064 / 256.;
+        lum.ptr<ushort>(i)[j] = val;
+      }
+      });
+  return lum;
 }
 
+std::tuple<cv::Mat, cv::Mat> lumDiffParallel(cv::Mat lumCurr, cv::Mat lumPrev) {
+  using namespace cv;
+  Size s = lumCurr.size();
+  lumCurr.convertTo(lumCurr,CV_16SC1);
+  lumPrev.convertTo(lumPrev,CV_16SC1);
+  Mat lumDelta = Mat(s, CV_16SC1);
+  Mat lumPos = Mat(s, CV_16SC1);
+  Mat lumNeg = Mat(s, CV_16SC1);
 
-std::tuple<cv::Mat, cv::Mat> lumDiff(const cv::Mat& lumCurr, const cv::Mat& lumPrev)
-{
-    using namespace cv;
-    Size s = lumCurr.size();
-    Mat lumDelta = Mat(s, CV_32FC1);
-    Mat lumPos = Mat(s, CV_32FC1);
-    Mat lumNeg = Mat(s, CV_32FC1);
-
-    lumDelta = lumCurr - lumPrev;
-
-    for (size_t j = 0; j < s.height; j++)
-    {
-        for (size_t k = 0; k < s.width; k++)
-        {
-            if (lumDelta.at<float>(j, k) > 1e-6)
-            {
-                lumPos.at<float>(j, k) = lumDelta.at<float>(j, k);
-                lumNeg.at<float>(j, k) = 0;
-            }
-            else
-            {
-                lumNeg.at<float>(j, k) = -lumDelta.at<float>(j, k);
-                lumPos.at<float>(j, k) = 0;
-            }
-        }
+  lumDelta = lumCurr - lumPrev;
+  parallel_for_(Range(0, s.width * s.height), [&](const Range &range) {
+    for (int r = range.start; r < range.end; ++r) {
+      size_t i = r / s.width;
+      size_t j = r % s.width;
+      if (lumDelta.ptr<short>(i)[j] > 1e-6) {
+        lumPos.ptr<short>(i)[j] = lumDelta.ptr<short>(i)[j];
+        lumNeg.ptr<short>(i)[j] = 0;
+      } else {
+        lumNeg.ptr<short>(i)[j] = -lumDelta.ptr<short>(i)[j];
+        lumPos.ptr<short>(i)[j] = 0;
+      }
     }
-    return std::make_tuple(lumNeg, lumPos);
+  });
+  return std::make_tuple(lumNeg, lumPos);
+}
+short lumAvgDiffParallel(cv::Mat lumCurr, cv::Mat lumPrev){
+
+  using namespace cv;
+  auto t = lumDiffParallel(lumCurr, lumPrev);
+  Mat lumPos = std::get<1>(t), lumNeg = std::get<0>(t);
+
+  Mat hPos, hNeg;
+  Size s = lumPos.size();
+
+  int hSize = s.height * s.width;
+
+  hPos = lumPos.reshape(1, 1);
+  hNeg = lumNeg.reshape(1, 1);
+
+  sort(hPos, hPos, SORT_DESCENDING);
+  sort(hNeg, hNeg, SORT_DESCENDING);
+
+  size_t histRequiredSize = hSize / 4.;
+  double nomNeg = 0., denNeg = 0., nomPos = 0., denPos = 0.;
+
+  if (hPos.at<short>(0, histRequiredSize) >= 1e-6 &&
+      hNeg.at<short>(0, histRequiredSize) >= 1e-6)
+    return std::max(cv::mean(hPos)[0], cv::mean(hNeg)[0]);
+  else if (hPos.at<short>(0, histRequiredSize) >= 1e-6 &&
+           hNeg.at<short>(0, histRequiredSize) < 1e-6)
+    return cv::mean(hPos)[0];
+  else if (hNeg.at<short>(0, histRequiredSize) >= 1e-6 &&
+           hPos.at<short>(0, histRequiredSize) < 1e-6)
+    return cv::mean(hNeg)[0];
+  else
+    return 0.0;
 }
 
+std::vector<size_t> getBadFramesIdxes(cv::String filename) {
+  using namespace cv;
+  setNumThreads(8);
+  VideoCapture cap(filename, cv::CAP_FFMPEG);
 
-double lumAvgDiff(const cv::Mat& lumCurr, const cv::Mat& lumPrev)
-{
-    using namespace cv;
-    auto t = lumDiff(lumCurr, lumPrev);
-    Mat lumPos = std::get<1>(t), lumNeg = std::get<0>(t);
+  size_t height=cap.get(CAP_PROP_FRAME_HEIGHT) ; 
+  size_t width =cap.get(CAP_PROP_FRAME_WIDTH) ; 
 
-    Mat hPos, hNeg;
-    Size s = lumPos.size();
+  size_t frameSize = height*width;
+  size_t totalFrames = cap.get(CAP_PROP_FRAME_COUNT);
+  size_t fps = cap.get(CAP_PROP_FPS);
 
-    int hSize = s.height * s.width;
+  // cv::Mat img(height,width, CV_8UC3);
 
-    hPos = lumPos.reshape(1, 1);
-    hNeg = lumNeg.reshape(1, 1);
+  short lumMeanCurr, lumMeanPrev=0, lumDiff;
+  std::vector<size_t> flashesIndex;
+  double t = (double)getTickCount();
 
-    sort(hPos, hPos, SORT_DESCENDING);
-    sort(hNeg, hNeg, SORT_DESCENDING);
+  std::ostringstream oss;
+  oss << "ffmpeg -loglevel panic -i " << filename
+      << " -c:v rawvideo -pix_fmt yuv420p out.yuv";
 
-    size_t histRequiredSize = hSize / 4.;
-    double nomNeg = 0., denNeg = 0., nomPos = 0., denPos = 0.;
+  std::system(oss.str().c_str());
 
-    if (hPos.at<float>(0, histRequiredSize) >= 1e-6 && hNeg.at<float>(0, histRequiredSize) >= 1e-6)
-        return std::max(cv::mean(hPos)[0], cv::mean(hNeg)[0]);
-    else if (hPos.at<float>(0, histRequiredSize) >= 1e-6 && hNeg.at<float>(0, histRequiredSize) < 1e-6)
-        return cv::mean(hPos)[0];
-    else if (hNeg.at<float>(0, histRequiredSize) >= 1e-6 && hPos.at<float>(0, histRequiredSize) < 1e-6)
-        return cv::mean(hNeg)[0];
-    else return 0.0;
-}
+  std::ifstream reader("out.yuv", std::ios::binary);
+  Mat L(height, width, CV_8UC1);
+  Mat L_prev;
+  char luma[frameSize];
 
-
-std::vector<size_t> getBadFramesIdxes(cv::String filename)
-{
-    using namespace cv;
-    VideoCapture cap(filename);
-
-    try
-    {
-        if (!cap.isOpened())
-        {
-            throw VideoReadingException();
-        }
+  for (size_t i = 0; i < totalFrames; ++i) {
+    reader.read(luma, frameSize);
+    reader.ignore(frameSize / 2);
+    Mat L(height, width, CV_8UC1, luma);
+    if (i > 0) {
+      lumDiff = lumAvgDiffParallel(L, L_prev);
     }
-    catch (VideoReadingException& ex)
-    {
-        std::cout << ex.what() << "\n";
-    }
+    lumMeanCurr = cv::mean(L)[0];
 
-    uint totalFrames = cap.get(CAP_PROP_FRAME_COUNT);
-    uint fps = cap.get(CAP_PROP_FPS);
+    if (std::min(lumMeanCurr, lumMeanPrev) <= 160 && std::abs(lumDiff) >= 20.)
+      flashesIndex.push_back(i);
+    lumMeanPrev = lumMeanCurr;
 
-    double lumMeanPrev;
+    L_prev = L.clone();
+    std::cout << "\r loading... : " << i << " out of " << totalFrames - 1
+              << " frames is processed" << ", time passed: "
+              << ((double)getTickCount() - t) / getTickFrequency() << " seconds"
+              << std::flush;
+  }
 
-    std::vector<size_t> flashesIndex;
-    std::vector<Mat> badFrames;
-
-    Mat framePrev, frameCurr, L_prev, L_curr;
-
-    double t = (double)getTickCount();
-
-    for (size_t j = 0; j < totalFrames; j++)
-    {
-        try
-        {
-            if (j == 0)
-            {
-                if (cap.read(framePrev))
-                {
-                    L_prev = lumCalc(framePrev);
-                    auto t = lumDiff(L_prev, Mat(L_prev.size(), CV_32FC1));
-                    lumMeanPrev = cv::mean(L_prev)[0];
-                }
-                else throw VideoReadingException();
-            }
-            else
-            {
-                if (cap.read(frameCurr))
-                {
-                    Mat L_curr = lumCalc(frameCurr);
-
-                    double lumDiffCurr = lumAvgDiff(L_curr, L_prev);
-                    double lumMeanCurr = cv::mean(L_curr)[0];
-
-                    if (std::min(lumMeanCurr, lumMeanPrev) <= 160 && lumDiffCurr >= 20.0)
-                    {
-                            // writer << j << ": " << lumDiffCurr << " " << lumMeanPrev << " " << lumMeanCurr << '\n';
-                            flashesIndex.push_back(j);
-                            // badFrames.push_back(frameCurr);
-                            // imshow("bad frames curr", frameCurr);
-                            // imshow("bad frames prev", framePrev);
-                            // waitKey(0);
-                            // using namespace std::chrono_literals;
-                            // std::this_thread::sleep_for((5000ms));
-                    }
-
-                    lumMeanPrev = lumMeanCurr;
-                    L_prev = L_curr.clone();
-                    framePrev = frameCurr.clone();
-                }
-                else throw VideoReadingException();
-            }
-            std::cout << "\r loading... : " << j + 1 << " out of " << totalFrames - 1
-                << " frames is processed" << ", time passed: "
-                << ((double)getTickCount() - t) / getTickFrequency() << " seconds" << std::flush;
-        }
-        catch (VideoReadingException& ex)
-        {
-            std::cout << ex.what() << '\n';
-        }
-
-    }
-    t = ((double)getTickCount() - t) / getTickFrequency();
-    std::cout << "\n Times passed in seconds: " << t << '\n';
-
-    return flashesIndex;
+  t = ((double)getTickCount() - t) / getTickFrequency();
+  std::cout << "\n Times passed in seconds: " << t << '\n';
+  std::system("rm out.yuv");
+  
+  // cv::Mat frame;
+  // namedWindow("TEST", WINDOW_GUI_NORMAL);
+  // auto it = flashesIndex.cbegin();
+  // auto end = flashesIndex.cend();
+  // if (it!=end)
+  // {
+  //   for (size_t i =0; i< totalFrames; ++i){
+  //     cap.read(frame);
+  //     if (i==*it){
+  //       imshow("TEST", frame);
+  //       waitKey(300);
+  //       ++it;
+  //     }
+  //   }
+  // }
+  return flashesIndex;
 }
