@@ -5,7 +5,8 @@
 #include <iostream>
 #include <immintrin.h>
 #include <opencv2/core/utility.hpp>
-#include <tbb/tbb.h>
+#include <thread>
+// #include <tbb/tbb.h>
 class VideoReadingException : public std::exception {
 public:
   std::string what() { return "frame was not read!\n"; }
@@ -89,15 +90,51 @@ short lumAvgDiffParallel(cv::Mat lumCurr, cv::Mat lumPrev){
 
 std::vector<size_t> getBadFramesIdxes(cv::String filename) {
   using namespace cv;
-  setNumThreads(8);
+  setNumThreads(std::thread::hardware_concurrency());
   VideoCapture cap(filename, cv::CAP_FFMPEG);
 
-  size_t height=cap.get(CAP_PROP_FRAME_HEIGHT) ; 
-  size_t width =cap.get(CAP_PROP_FRAME_WIDTH) ; 
+  size_t initHeight=cap.get(CAP_PROP_FRAME_HEIGHT) ; 
 
-  size_t frameSize = height*width;
+  
+  size_t initWidth =cap.get(CAP_PROP_FRAME_WIDTH) ; 
+
   size_t totalFrames = cap.get(CAP_PROP_FRAME_COUNT);
   size_t fps = cap.get(CAP_PROP_FPS);
+  
+  double ratio = (double)initHeight / initWidth;
+  size_t height=initHeight, width=initWidth;
+  size_t frameSize = initHeight*initWidth;
+
+  std::string scaledFilename = filename;
+  std::ostringstream oss;
+
+  bool needToDelete=false;
+
+  if (initHeight>640)
+  {
+    if (initHeight>initWidth)
+    {
+      width = 640;
+      height = (double)width/ratio;
+    }
+    else 
+    {
+      height = 640;
+      width = (double)height * ratio  ;
+    }
+    frameSize = height*width;
+    if (width % 2 != 0) {
+      height += 2;
+    }
+    oss << "ffmpeg -loglevel error -i " << filename << " -filter:v scale=" << height 
+        << ":-1 -c:a copy out.mp4";
+    std::system(oss.str().c_str());
+    oss.str("");
+    needToDelete = true;
+    scaledFilename = "out.mp4";
+    std::cout<<height<<" "<<width<<"\n";
+  }
+
 
   // cv::Mat img(height,width, CV_8UC3);
 
@@ -105,9 +142,7 @@ std::vector<size_t> getBadFramesIdxes(cv::String filename) {
   std::vector<size_t> flashesIndex;
   double t = (double)getTickCount();
 
-  std::ostringstream oss;
-  oss << "ffmpeg -loglevel panic -i " << filename
-      << " -c:v rawvideo -pix_fmt yuv420p out.yuv";
+  oss<<"ffmpeg -loglevel error -i "<< scaledFilename<<" -c:v rawvideo -pix_fmt yuv420p out.yuv";
 
   std::system(oss.str().c_str());
 
@@ -138,8 +173,10 @@ std::vector<size_t> getBadFramesIdxes(cv::String filename) {
 
   t = ((double)getTickCount() - t) / getTickFrequency();
   std::cout << "\n Times passed in seconds: " << t << '\n';
+  if (needToDelete)
+    std::system("rm out.mp4");
   std::system("rm out.yuv");
-  
+
   // cv::Mat frame;
   // namedWindow("TEST", WINDOW_GUI_NORMAL);
   // auto it = flashesIndex.cbegin();
@@ -149,6 +186,7 @@ std::vector<size_t> getBadFramesIdxes(cv::String filename) {
   //   for (size_t i =0; i< totalFrames; ++i){
   //     cap.read(frame);
   //     if (i==*it){
+  //       std::cout<<i<<"\n";
   //       imshow("TEST", frame);
   //       waitKey(300);
   //       ++it;
