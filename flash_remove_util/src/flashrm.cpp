@@ -94,9 +94,8 @@ std::vector<size_t> getBadFramesIdxes(cv::String filename) {
   VideoCapture cap(filename, cv::CAP_FFMPEG);
 
   size_t initHeight=cap.get(CAP_PROP_FRAME_HEIGHT) ; 
-
-  
   size_t initWidth =cap.get(CAP_PROP_FRAME_WIDTH) ; 
+  std::cout<<"init: "<<initHeight<<' '<<initWidth<<'\n';
 
   size_t totalFrames = cap.get(CAP_PROP_FRAME_COUNT);
   size_t fps = cap.get(CAP_PROP_FPS);
@@ -110,7 +109,7 @@ std::vector<size_t> getBadFramesIdxes(cv::String filename) {
 
   bool needToDelete=false;
 
-  if (initHeight>640)
+  if (initHeight>640 || initWidth >360)
   {
     if (initHeight>initWidth)
     {
